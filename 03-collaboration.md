@@ -1,243 +1,256 @@
 # 3. Real-Time Collaboration
 
-SlideMaker supports multiple users editing the same deck simultaneously,
-with live cursors, presence indicators, and per-element protection against
-conflicting edits. The collaboration layer is a *hybrid* of two well-known
-patterns: a CRDT for text and pessimistic locks for everything else. This
-chapter explains why the hybrid exists and how it works.
+Multiple users can edit the same deck simultaneously, with live
+cursors, presence, and per-element protection against conflicting
+edits. The collaboration layer is a *hybrid* of two patterns: a CRDT
+for text and pessimistic locks for everything else. This chapter
+explains why and how.
 
 ## 3.1 The two-mode problem
 
-Editing a slide deck combines two very different editing surfaces:
+Editing a slide deck combines two different editing surfaces:
 
-1. **Text inside a text element** — many small, mergeable edits, often
-   typed by two people at once into different parts of the same paragraph.
-2. **Everything that isn't text** — moving a shape, resizing an image,
-   replacing a chart's data, changing a table's structure. These are
-   coarse-grained, hard-to-merge operations.
+1. **Text inside a text element.** Many small mergeable edits, often
+   typed into different parts of the same paragraph at once.
+2. **Everything that isn't text.** Moving a shape, resizing an image,
+   replacing a chart's data, changing a table's structure.
 
-The right tool for (1) is a CRDT: it merges concurrent insertions cleanly
-without needing a server to arbitrate. The right tool for (2) is a lock:
-two people dragging the same rectangle in different directions has no
-sensible "merged" result, and any auto-merge will produce a glitched
-position. We use **Yjs** for text and a **pessimistic lock manager** for
-everything else.
+The right tool for (1) is a CRDT: it merges concurrent insertions
+cleanly without needing a central arbiter. The right tool for (2) is
+a lock: two people dragging the same rectangle in opposite directions
+has no sensible "merged" result.
 
-```mermaid
-flowchart TD
-    Edit["User edit"] --> K{"Kind of edit?"}
-    K -->|"text inside element"| Y["Yjs delta<br/>(merge, no lock)"]
-    K -->|"move/resize/data"| L["Lock manager<br/>(acquire → mutate → release)"]
-    Y --> B1["Broadcast via Yjs<br/>awareness channel"]
-    L -->|granted| M["Apply mutation"]
-    L -->|denied| R["Reject; show owner"]
-    M --> B2["Broadcast as<br/>slide_update event"]
+```
+                  user edit
+                     |
+                     v
+            +------------------+
+            | kind of edit?    |
+            +---+----------+---+
+                |          |
+        text    |          |  position / data / structure
+         in     |          |
+       element  v          v
+        +----------+   +-------------+
+        |   Yjs    |   |    Lock     |
+        | delta    |   |  manager    |
+        +-----+----+   +------+------+
+              |               |
+         broadcast       acquire ->
+         via awareness   mutate ->
+         channel         release
+              |               |
+              +-------+-------+
+                      |
+                      v
+                room broadcast
+                to other clients
 ```
 
 ## 3.2 Room model
 
-A **room** is one editing session for one deck. Joining a room means
-opening a Socket.IO session, sending a `join_room` event with the deck id
-and a user identity, and receiving back the current room state.
+A room is one editing session for one deck. Joining a room opens a
+Socket.IO session, sends a `join_room` event with the deck id and a
+user identity, and receives back the room's current state.
 
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant S as Server
-    participant R as Room
-
-    C->>S: connect (WebSocket)
-    S-->>C: connected
-    C->>S: join_room(deck_id, user)
-    S->>R: register session
-    R-->>C: room_users(list of existing)
-    R->>R: notify others: user_joined
-    Note over R: Yjs state catch-up
-    R-->>C: yjs_sync_full(state)
+```
+   Client                    Server                    Room state
+     |                          |                           |
+     | connect (WebSocket)      |                           |
+     |------------------------> |                           |
+     |     "connected"          |                           |
+     | <----------------------- |                           |
+     |                          |                           |
+     | join_room(deck_id, user) |                           |
+     |------------------------> |                           |
+     |                          | register session ----->   |
+     |                          | <----- existing users     |
+     |     room_users           |                           |
+     | <----------------------- |                           |
+     |                          | notify others             |
+     |                          | --- user_joined --->      |
+     |                          |                           |
+     |     yjs_sync_full        |                           |
+     | <----------------------- |                           |
 ```
 
-Once joined, four channels of traffic flow between client and server:
+Four channels of traffic exist after the join:
 
-| Channel | Direction | Cardinality | Purpose |
-|---------|-----------|-------------|---------|
-| Yjs sync | bidirectional | broadcast | Text deltas + initial state catch-up |
-| Awareness | bidirectional | broadcast | Cursor position, user color, active element |
-| Slide update | bidirectional | broadcast (excluding sender) | Non-text mutations |
-| Element locks | bidirectional | request/response + broadcast | Lock acquire/release/heartbeat |
+| Channel | Direction | Purpose |
+|---------|-----------|---------|
+| Yjs sync | bidirectional | text deltas + initial state catch-up |
+| Awareness | bidirectional | cursor position, color, focused element |
+| Slide update | bidirectional | non-text mutations |
+| Element locks | request/response + broadcast | lock acquire / release / heartbeat |
 
 ## 3.3 Yjs sync
 
-Yjs is a CRDT library. Each client and the server hold a copy of the same
-Yjs document. Local edits produce *updates* (binary deltas) that are
-broadcast to every other client in the room; remote updates are applied to
-the local doc. Conflicts are merged deterministically by the algorithm; no
-server arbitration is required.
+Yjs is a CRDT library. Each client and the server hold a copy of the
+same Yjs document. Local edits produce binary deltas that are
+broadcast to every other client in the room; remote updates are
+applied to the local doc. The server is a pure broadcaster; it does
+not transform Yjs updates.
 
-```mermaid
-sequenceDiagram
-    participant A as Alice
-    participant S as Server
-    participant B as Bob
-    A->>A: types "Hello"
-    A->>S: yjs_update(delta_a)
-    S->>B: yjs_update(delta_a)
-    B->>B: applies → "Hello"
-    par concurrent edits
-        A->>A: types "!" at end
-        B->>B: types " world" at end
-    end
-    A->>S: yjs_update(delta_a2)
-    B->>S: yjs_update(delta_b)
-    S->>B: yjs_update(delta_a2)
-    S->>A: yjs_update(delta_b)
-    Note over A,B: Both converge to<br/>"Hello world!" (Yjs CRDT merge)
+```
+   Alice                    Server                       Bob
+     |                        |                          |
+     | types "Hello"          |                          |
+     | -- yjs_update -------> |                          |
+     |                        | -- yjs_update ---------> |
+     |                        |                          | applies
+     |                        |                          | "Hello"
+     |                        |                          |
+     | types "!" at end       |                          | types " world"
+     | -- yjs_update -------> |                          | -- yjs_update -->
+     |                        | -- yjs_update ---------> |
+     |                        | <------ yjs_update ----- |
+     | applies " world"       |                          | applies "!"
+     |                        |                          |
+     |          both converge to "Hello world!"         |
 ```
 
-The server in this flow is a pure broadcaster for Yjs traffic. It does not
-inspect or transform the updates. The only place it touches the Yjs doc is
-when a new client joins and needs the catch-up state.
+The CRDT does the heavy lifting; the server only routes bytes.
 
 ## 3.4 Awareness (cursors and presence)
 
-Awareness is everything that *isn't* the document itself: who is in the
-room, what color is assigned to them, where their cursor is, and which
-element they currently have focused.
+Awareness is everything that *isn't* the document: who is in the room,
+their color, where the cursor is, which element is focused. Awareness
+is broadcast and never persisted; on a server restart it is lost and
+rebuilt as clients send their next update.
 
-Awareness updates are *transient* — they are broadcast to other clients
-and never persisted. If the server restarts, awareness is lost and rebuilt
-as clients send their next update.
-
-```mermaid
-flowchart LR
-    A["Alice<br/>moves cursor"] -->|awareness_update| S["Server"]
-    S -->|fanout| B["Bob"]
-    S -->|fanout| C["Carol"]
-    B & C --> Render["Render Alice's<br/>cursor + label"]
+```
+   Alice               Server               Bob       Carol
+     |                   |                   |          |
+     | move cursor       |                   |          |
+     | -- awareness ---> |                   |          |
+     |                   | --- fanout -----> |          |
+     |                   | --- fanout ----------------> |
+     |                                       |          |
+                                  Render Alice's cursor + label
 ```
 
-Each user is assigned a color deterministically from a hash of their user
-id, so the same person looks the same across sessions and across other
-users' screens.
+Each user gets a deterministic color from a hash of their user id, so
+they look the same across sessions and across other users' screens.
 
 ## 3.5 Pessimistic locks for non-text edits
 
-For non-text mutations — moving a shape, changing chart data, replacing an
-image — a pessimistic lock model is used:
+For non-text mutations a pessimistic lock model is used:
 
-1. When a user **focuses** a non-text element, the client requests a lock.
-2. The server's lock manager grants or denies based on the current owner.
-3. While the lock is held, the client may mutate the element freely; all
-   other clients see a "locked by Alice" overlay on that element.
-4. The client sends a **heartbeat** every few seconds while the lock is
-   held; missing heartbeats cause the lock to expire.
-5. On blur or unmount, the client **releases** the lock.
-
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant L as Lock Manager
-    participant R as Room
-
-    C->>L: element_lock_acquire(elem_id)
-    alt elem free
-        L-->>C: element_lock_granted
-        L->>R: element_locked(elem_id, owner)
-        loop while held
-            C->>L: element_lock_heartbeat(elem_id)
-        end
-        C->>L: element_lock_release(elem_id)
-        L->>R: element_unlocked(elem_id)
-    else elem held by other
-        L-->>C: element_lock_denied(owner)
-    end
-```
-
-### 3.5.1 Lock state
-
-The lock manager keeps an in-memory table per room:
+1. Client requests a lock when the user focuses an element.
+2. Server grants or denies based on the current owner.
+3. While the lock is held, the client may mutate freely; other clients
+   see a "locked by Alice" overlay on that element.
+4. The client heartbeats every few seconds; a missed heartbeat expires
+   the lock.
+5. On blur or unmount, the client releases the lock.
 
 ```
-element_id  →  { owner_session, acquired_at, last_heartbeat }
+   Client                Lock Manager                Room
+     |                        |                       |
+     | acquire(elem_id)       |                       |
+     | ---------------------> |                       |
+     |                        | check owner table     |
+     |                        |                       |
+     |  if free:              |                       |
+     |     granted            |                       |
+     | <--------------------- |  ---- element_locked  |
+     |                        |       ------------->  |
+     |                        |                       |
+     |  loop while held:      |                       |
+     |     heartbeat -------> |                       |
+     |                        |                       |
+     |     release ---------> |  ---- element_unlock  |
+     |                        |       ------------->  |
+     |                                                |
+     |  if held by other:                             |
+     |     denied (owner)                             |
+     | <--------------------- |                       |
 ```
 
-This state is intentionally *not* persisted. On server restart, all locks
-reset to free; clients re-acquire as users refocus elements. The user
-experience is a brief flicker, not data loss.
+### Why pessimistic, not optimistic
 
-### 3.5.2 Why pessimistic, not optimistic
+An optimistic model — let everyone mutate, reconcile after — could
+work for non-text edits with operational transforms. In practice, the
+UX of "your move was undone because someone else moved it first" is
+worse than "you can't move this right now because someone else is."
 
-An optimistic model — let everyone mutate, reconcile after — could in
-principle work for non-text edits with operational transforms. In practice,
-the UX of "your move was undone because someone else moved it first" is
-worse than "you can't move this right now because someone else is." The
-pessimistic model also avoids needing to ship OT logic for every element
-kind.
+## 3.6 The echo-loop guard
 
-## 3.6 The two-flag echo-loop guard
+Yjs updates and slide_update events flow through the same socket. When
+a local edit is broadcast, the same change must not bounce back from
+the server and be re-applied locally as if it came from a remote
+client.
 
-Both Yjs updates and slide_update events flow through the same Socket.IO
-session. When a local edit is broadcast, the same change must not bounce
-back from the server and be re-applied locally as if it came from a remote
-client. The guard is a pair of module-scoped flags:
+The guard is a pair of module-scoped flags:
 
-- `isApplyingRemote` — set true while a remote update is being applied;
-  the broadcast subscription checks this flag and skips re-broadcasting.
-- `lastRemoteUpdate` — a per-slide `{ slideIndex, timestamp }`; if a local
-  change matches the slide of a remote update received within 200 ms, the
-  broadcast is suppressed as an echo.
+- `isApplyingRemote` — set while a remote update is being applied; the
+  broadcast subscription checks this and skips re-broadcasting.
+- `lastRemoteUpdate` — a recent `{ slideIndex, timestamp }`; if a
+  local change matches the slide of a remote update received within
+  200 ms, the broadcast is suppressed as an echo.
 
-```mermaid
-stateDiagram-v2
-    [*] --> Idle
-    Idle --> ApplyingRemote: remote update arrives
-    ApplyingRemote --> Idle: 150 ms timer
-    Idle --> Broadcasting: local change
-    Broadcasting --> Idle: emitted to server
-    ApplyingRemote --> Idle: any other change suppressed
+```
+        Idle
+         |  remote update arrives
+         v
+   ApplyingRemote ----- 150 ms timer -----+
+         |                                |
+         |  any "local" change            v
+         v  suppressed                  Idle
+       Idle                             |
+         |  user edit                   |
+         v                              |
+    Broadcasting --- emit to server --> Idle
 ```
 
-The 150 ms / 200 ms windows are deliberately *just* long enough to cover
-the round-trip and store-subscription tick, and deliberately *just* short
-enough to not suppress a genuine quick local edit after a remote one.
+The 150 ms / 200 ms windows are just long enough to cover the round
+trip and the store-subscription tick, and just short enough to not
+suppress a genuine quick local edit after a remote one.
 
-The history of this guard, including the StrictMode double-mount bug that
+The history of this guard, including the React StrictMode bug that
 made the original implementation insufficient, is in
 [case-studies/echo-loop.md](case-studies/echo-loop.md).
 
-## 3.7 What is broadcast vs what is saved
+## 3.7 Broadcast path vs save path
 
-A useful mental model: there are two write paths in collaboration.
+Two write paths in collaboration:
 
-```mermaid
-flowchart LR
-    L["Local change"] --> B["Broadcast<br/>(other clients)"]
-    L --> S["Save<br/>(MySQL)"]
-    B -.->|debounced batch| S
+```
+                    local change
+                         |
+              +----------+----------+
+              |                     |
+              v                     v
+        broadcast              save (debounced)
+        (other clients          (MySQL)
+         in real time)
+              |                     ^
+              |                     |
+              +---- debounced ------+
+                    batch flush
 ```
 
 The broadcast path runs immediately; collaborators see the change in
-< 50 ms. The save path is debounced and batched; the database catches up
-within a few seconds. If the user closes their tab after the broadcast but
-before the save, the change is preserved in collaborators' Yjs / slide
-state and reaches the database via the next save from any of them.
+under fifty milliseconds. The save path is debounced and batched;
+the database catches up in a few seconds. If the user closes their
+tab after broadcasting but before saving, collaborators still have
+the change, and it reaches the database via the next save from any of
+them.
 
-## 3.8 Limits of the current model
+## 3.8 Limits
 
-- **Single application origin.** Lock state lives in process memory; a
-  horizontally scaled collab tier would need either sticky sessions or a
-  shared lock store (Redis, etc).
-- **No offline editing.** A disconnected client cannot edit; Yjs supports
-  offline-first patterns, but the rest of the system (auth, save) does
-  not, so this is artificially gated.
-- **No cross-deck cursor.** Awareness is per room, by design.
+- **Single application origin.** Lock state lives in process memory;
+  a multi-origin setup would need a shared lock store.
+- **No offline editing.** A disconnected client cannot edit.
+- **No cross-deck awareness.** Awareness is per-room, by design.
 
-## 3.9 Connections to other chapters
+## 3.9 Connections
 
-- The Socket.IO transport choice and worker affinity are in
+- Transport choice and worker affinity are in
   [chapter 9](09-concurrency-model.md).
 - Bug stories: [echo-loop](case-studies/echo-loop.md),
-  [late-login anonymous identity](case-studies/late-login-anonymous-id.md).
-- The decision to use Yjs over Operational Transform is in
+  [late-login-anonymous-id](case-studies/late-login-anonymous-id.md).
+- Why Yjs over OT:
   [ADR-002](decisions/ADR-002-yjs-over-ot.md).
-- The decision to use pessimistic locks over OT for non-text elements is
-  in [ADR-003](decisions/ADR-003-pessimistic-element-locks.md).
+- Why pessimistic locks for non-text:
+  [ADR-003](decisions/ADR-003-pessimistic-element-locks.md).

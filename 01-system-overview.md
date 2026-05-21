@@ -1,197 +1,176 @@
 # 1. System Overview
 
-SlideMaker is a single-team production system that turns a natural-language
-prompt (and optionally a document) into a structured slide deck a user can
-edit, share, and collaborate on in real time. This document describes the
-high-level shape of the system: what processes exist, how they communicate,
-and where the synchronous and asynchronous paths run.
+SlideMaker turns a natural-language prompt (and optionally an attached
+document) into a slide deck that can be edited, shared, and
+collaborated on in real time. This chapter sketches the moving parts at
+a high level: what processes exist, how they talk to each other, and
+where the synchronous and asynchronous paths run.
 
-## 1.1 Process boundaries
+## 1.1 Big picture
 
-The system is composed of three long-running processes, a managed datastore,
-and several external services. There is no microservice mesh; the single
-backend process is a deliberately monolithic Flask application.
+There is a browser application, an application server, a database, and
+a small set of external services.
 
-```mermaid
-flowchart LR
-    subgraph Edge["Edge"]
-        CF["CDN / Edge Proxy"]
-    end
-
-    subgraph Browser["Browser"]
-        Next["Next.js<br/>App Router"]
-        WS["Socket.IO<br/>Client"]
-    end
-
-    subgraph App["Application Server"]
-        Flask["Flask App<br/>(HTTP)"]
-        SIO["Socket.IO<br/>Server"]
-        Sched["Scheduler<br/>Tick"]
-    end
-
-    subgraph Data["Data"]
-        DB[("MySQL")]
-        Vault[("Token Vault<br/>(Fernet)")]
-    end
-
-    subgraph External["External"]
-        LLM["LLM Providers"]
-        OAuth["Google OAuth"]
-        Drive["Google Drive<br/>(file-scoped)"]
-    end
-
-    CF --> Next
-    Next -->|HTTP / SSE| Flask
-    WS -->|WebSocket| SIO
-    Flask --> DB
-    Flask --> Vault
-    Flask -->|HTTPS| LLM
-    Flask -->|OAuth| OAuth
-    Flask -->|drive.file| Drive
-    SIO --> DB
-    Sched --> Flask
-    Sched --> DB
+```
+            +----------------+
+            |   Edge proxy   |
+            |  (TLS + CDN)   |
+            +-------+--------+
+                    |
+        +-----------+-----------+
+        |                       |
+        v                       v
++----------------+      +----------------+
+|    Browser     |      |   Browser      |
+| (Next.js app)  | ...  | (Next.js app)  |
++--------+-------+      +--------+-------+
+         |                       |
+         |  HTTP / SSE / WS      |
+         +-----------+-----------+
+                     |
+                     v
+            +------------------+
+            |  Application     |
+            |  server          |
+            |                  |
+            |  + HTTP handlers |
+            |  + Socket.IO    |
+            |  + Scheduler    |
+            +-+-------+------+-+
+              |       |      |
+              v       v      v
+       +---------+ +----+ +-------------------+
+       | MySQL   | |Vault| | External:        |
+       |         | |     | |   LLM providers  |
+       |         | |     | |   Google OAuth   |
+       |         | |     | |   Google Drive   |
+       +---------+ +-----+ +-------------------+
 ```
 
-### 1.1.1 The three processes
+A short tour of each box:
 
-| Process | Runtime | Role |
-|---------|---------|------|
-| **Next.js** | Node.js | Renders the public site and the editor SPA; performs SSR for marketing pages; proxies API and auth calls to the application server. |
-| **Flask application** | Python | All business logic. Hosts the REST API, the Socket.IO server, and the in-process scheduler tick. |
-| **Edge proxy** | Managed | Terminates TLS, applies edge caching for the public site, and routes WebSocket connections to the application origin without buffering. |
+| Box | Role |
+|-----|------|
+| Edge proxy | Terminates TLS, caches the marketing site, routes WebSocket connections through to the application origin without buffering. |
+| Browser | Renders the Next.js application. Holds the editor SPA, the rendered slides, and the Socket.IO client for collaboration. |
+| Application server | A single process running the HTTP handlers, the Socket.IO server, and the in-process scheduler tick. All business logic lives here. |
+| MySQL | The durable store: decks, slides, themes, users, schedules, runs. |
+| Vault | The encrypted store for refresh tokens of external providers (see chapter 7). |
+| External services | LLM providers for generation, Google for OAuth and per-file Drive access. |
 
-### 1.1.2 Why one application process
+The application server is intentionally one process. A microservice
+split was considered and not pursued; the operational cost is greater
+than the benefit at this size.
 
-A microservice split would require a separate AI worker, a separate
-collaboration worker, and a message bus to coordinate them. For a single-team
-system at this scale, the operational cost of running and observing four
-processes is greater than the cost of keeping the application monolithic.
-When the bottleneck shifts, the first split will be the LLM-calling code (it
-is the only path that is both slow and embarrassingly parallel); not the
-collaboration server, not the scheduler.
+## 1.2 Three request paths
 
-## 1.2 Request paths
+The system speaks three different "shapes" of request depending on the
+workload.
 
-Three distinct request paths exist. Each has different latency, durability,
-and failure-recovery characteristics.
-
-```mermaid
-flowchart TB
-    Start(["User action"]) --> Type{"Path?"}
-    Type -->|Short request| Sync["Sync HTTP<br/>p50 ~ 100ms"]
-    Type -->|Generation| SSE["SSE stream<br/>p50 ~ 30s end-to-end"]
-    Type -->|Live edit| WS["WebSocket<br/>p50 ~ 30ms round-trip"]
-
-    Sync --> SyncR["JSON response<br/>(idempotent retry)"]
-    SSE --> SSER["Incremental events<br/>(client reassembles)"]
-    WS --> WSR["Broadcast to room<br/>(at-most-once)"]
+```
+   sync HTTP                SSE stream              WebSocket
+  -----------              -----------             -----------
+       |                        |                       |
+   ~ 100 ms                  ~ 30 s                  ongoing
+   request                end-to-end             round-trip ~30 ms
+       |                        |                       |
+       v                        v                       v
+   one JSON           many event lines         many small frames
+   response           ("outline_ready",        ("yjs_update",
+                      "slide_ready", ...)     "awareness", ...)
 ```
 
-### 1.2.1 Synchronous HTTP
+### Sync HTTP
 
 Used for: auth, profile, listing decks, fetching a deck, saving a deck,
-template metadata, billing-adjacent flows.
+template metadata. Short critical sections, idempotent or near-
+idempotent.
 
-These are idempotent or near-idempotent operations with a short critical
-section. The client uses an axios instance with a session-id interceptor;
-the server uses standard Flask request handlers backed by SQLAlchemy.
+### Server-Sent Events (SSE)
 
-### 1.2.2 Server-Sent Events (SSE)
+Used for: AI-driven generation, where the user sees slides appear one
+at a time as the LLM produces them. SSE gives the user feedback after
+about three seconds (when the first slide arrives) rather than after
+the full thirty seconds of the run. Full discussion in
+[chapter 4](04-streaming-protocol.md).
 
-Used for: AI-driven slide generation, where the user sees slides appear one
-at a time as the LLM produces them. SSE is preferred over a single
-long-blocking POST because it gives the user feedback after the first
-~3 seconds (when the first slide arrives) rather than after the full ~30
-seconds of the run.
+### WebSocket (Socket.IO)
 
-A full discussion of the streaming protocol — event types, reassembly,
-reconnection — is in [chapter 4](04-streaming-protocol.md).
-
-### 1.2.3 WebSocket (Socket.IO)
-
-Used for: real-time collaboration. Cursor positions, awareness updates, Yjs
-text deltas, and pessimistic lock requests for non-text elements all flow
-through a single Socket.IO session per editor tab. The server is configured
-to accept only the WebSocket transport, not the long-polling fallback; the
-reasons are in [chapter 9](09-concurrency-model.md) and
-[ADR-001](decisions/ADR-001-websocket-only-transport.md).
+Used for: real-time collaboration. Cursors, awareness, text deltas,
+and pessimistic lock requests for non-text elements all flow through a
+single Socket.IO session per editor tab. The server is configured to
+accept only WebSocket, not the long-polling fallback; reasons in
+[chapter 9](09-concurrency-model.md).
 
 ## 1.3 The five end-to-end flows
 
-The system has surprisingly few user-facing flows. Most user value compresses
-into one of these:
+The product compresses into five flows. Most user value lives in flow
+1 and flow 3.
 
-```mermaid
-flowchart LR
-    A["1. Generate"] --> B["2. Edit"]
-    B --> C["3. Collaborate"]
-    C --> D["4. Export"]
-    A -.-> E["5. Schedule<br/>(recurring generate)"]
-    E --> A
+```
+   +-----------+     +----------+     +---------------+
+   | Generate  | --> |   Edit   | --> | Collaborate   |
+   +-----------+     +----------+     +-------+-------+
+        ^                                     |
+        |                                     v
+        |                              +---------------+
+        |                              |    Export     |
+        |                              +---------------+
+        |
+        |  (scheduled, recurring)
+   +----+------+
+   | Schedule  |
+   +-----------+
 ```
 
-| # | Flow | Dominant path | Discussed in |
-|---|------|---------------|--------------|
-| 1 | Generate a deck from a prompt | SSE | [chapter 2](02-generation-pipeline.md) |
-| 2 | Edit slides in the canvas | Sync HTTP | [chapter 5](05-theme-and-brand-kit.md) |
-| 3 | Collaborate live with others | WebSocket | [chapter 3](03-collaboration.md) |
-| 4 | Export to PPTX / PDF / Google Slides | Sync HTTP + OAuth | [chapter 7](07-oauth-and-token-vault.md) |
-| 5 | Schedule recurring generation | Scheduler tick + SSE | [chapter 8](08-scheduled-decks.md) |
+| Flow | Dominant path | Chapter |
+|------|---------------|---------|
+| Generate a deck | SSE | [2](02-generation-pipeline.md) |
+| Edit slides | Sync HTTP | [5](05-theme-and-brand-kit.md) |
+| Collaborate | WebSocket | [3](03-collaboration.md) |
+| Export | Sync HTTP + OAuth | [7](07-oauth-and-token-vault.md) |
+| Schedule | Scheduler tick + SSE (server-side) | [8](08-scheduled-decks.md) |
 
-## 1.4 What lives in the browser, what lives on the server
+## 1.4 Where state lives
 
-A common confusion in editor-style web apps is *where* the document state of
-record lives. SlideMaker's answer: the **server is the source of truth**;
-the browser holds a *projection* that can diverge during an editing session
-and is reconciled back to the server.
+A common confusion in editor-style web apps is *where* the document
+state of record lives. The answer here: the server is the source of
+truth; the browser holds a projection that can diverge during editing
+and is reconciled back.
 
-```mermaid
-flowchart LR
-    subgraph Browser
-        ZS["Zustand store<br/>(slides, theme, brand kit)"]
-        Y["Yjs doc<br/>(text deltas, in-room only)"]
-        Q["Quill editor<br/>(rich text)"]
-    end
-
-    subgraph Server
-        DB[("MySQL<br/>(deck of record)")]
-        RM["Room state<br/>(lock table, awareness)"]
-    end
-
-    Q -- "delta" --> Y
-    Y <-->|broadcast| RM
-    ZS -- "save" --> DB
-    DB -- "load" --> ZS
-    RM -. "lock granted/denied" .-> ZS
+```
+            BROWSER                                   SERVER
+   +---------------------------+           +------------------------+
+   |  Zustand store            |           |  MySQL                 |
+   |  (slides, theme,          |   save    |  (deck of record)      |
+   |   brand kit)              | --------> |                        |
+   |                           | <-------- |                        |
+   |  Yjs document             |   load    |                        |
+   |  (per-room text deltas,   |           |                        |
+   |   in-memory only)         |           |                        |
+   |                           |           |  Room state            |
+   |  Quill editor             |   ws      |  (lock table,          |
+   |  (rich text per element)  | <-------> |   awareness, sessions) |
+   +---------------------------+           +------------------------+
 ```
 
-- **Zustand store** holds the working copy of slides, theme, and brand kit
-  in the browser. It is persisted to MySQL on save and via auto-save.
-- **Yjs document** is per-collab-room ephemeral state for text. It is
-  *not* the durable store; on a clean reload, slides re-hydrate from
-  MySQL and a fresh Yjs doc starts.
-- **Quill editor** is the rich-text surface for each text element; its
-  Deltas flow into Yjs.
-- **Room state** lives in memory on the application server. It tracks
-  who is in the room, who holds which element lock, and is throw-away
-  on server restart (locks reset to free, awareness re-syncs as users
-  reconnect).
+- **Zustand store** holds the working copy of slides, theme, brand kit
+  in the browser. Saved to MySQL on user save and via auto-save.
+- **Yjs document** is per-room ephemeral state for text. *Not* durable.
+  On a clean reload, slides re-hydrate from MySQL and a fresh Yjs doc
+  starts.
+- **Room state** lives in the application server's memory. Tracks who
+  is in a room, who holds which element lock, and is throw-away on
+  server restart.
 
 ## 1.5 What this system is not
 
-To set expectations for the rest of the document:
+To set expectations for later chapters:
 
-- **Not horizontally scaled.** There is one application origin. The
-  collaboration protocol assumes this and would need significant work to
-  shard (sticky sessions, cross-node lock coordination). See
-  [chapter 9](09-concurrency-model.md).
-- **Not a multi-tenant SaaS in the enterprise sense.** No per-tenant
-  isolation guarantees beyond user-level row scoping in the database.
-- **Not built on a managed platform.** No serverless functions, no managed
-  queues, no managed websocket gateway.
-- **Not "agentic."** The AI calls are bounded, structured prompt patterns
-  that produce JSON. There is no autonomous loop, no tool use beyond
-  document-content extraction.
+- Not horizontally scaled. There is one application origin.
+- Not agentic. AI calls are bounded, structured prompts that produce
+  JSON. No autonomous loop, no tool use beyond document extraction.
+- Not offline-first. Browser editor needs a network for save and
+  collaboration.
 
-Each subsequent chapter takes one slice of this picture and goes deep.
+Each chapter takes one slice of this picture and goes deeper.
